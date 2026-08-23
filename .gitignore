@@ -1,0 +1,7 @@
+.pio
+.vscode
+.cache
+.tools
+.venv
+
+compile_commands.json
