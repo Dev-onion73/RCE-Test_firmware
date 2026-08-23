@@ -1,0 +1,7 @@
+{
+  "name": "Netping",
+  "version": "1.0.0",
+  "description": "Netping PlatformIO library",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}
