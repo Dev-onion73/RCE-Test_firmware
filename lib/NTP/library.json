@@ -1,0 +1,7 @@
+{
+  "name": "NTP",
+  "version": "1.0.0",
+  "description": "NTP PlatformIO library",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

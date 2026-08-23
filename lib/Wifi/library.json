@@ -1,0 +1,7 @@
+{
+  "name": "Wifi",
+  "version": "1.0.0",
+  "description": "Wifi PlatformIO library",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}
