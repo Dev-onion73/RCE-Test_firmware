@@ -4,6 +4,7 @@
 #include <Wifi.h>
 #include <Netping.h>
 #include <NTP.h>
+#include <lora_radio.h>
 
 static const uint32_t SERIAL_BAUD = 115200;
 
@@ -75,6 +76,7 @@ static void showMainMenu() {
     Serial.println("1. Wi-Fi");
     Serial.println("2. Ping");
     Serial.println("3. NTP Time");
+    Serial.println("4. LoRa Radio");
     Serial.println("X. Exit");
     Serial.println();
     Serial.print("Select feature: ");
@@ -93,6 +95,8 @@ static void featureMenu() {
             Netping::feature();
         } else if (command == "3") {
             NTP::feature();
+        } else if (command == "4") {
+            LoRaRadio::feature();
         } else if (command.equalsIgnoreCase("X")) {
             Serial.println("Node entering standby.");
             return;
@@ -111,6 +115,7 @@ void setup() {
     Wifi::begin();
     Netping::begin();
     NTP::begin();
+    LoRaRadio::begin();
 
     Serial.println();
     Serial.println("========================================");
@@ -151,6 +156,7 @@ void loop() {
     Wifi::service();
     Netping::service();
     NTP::service();
+    LoRaRadio::service();
 
     if (Serial.available()) {
         String command = Serial.readStringUntil('\n');

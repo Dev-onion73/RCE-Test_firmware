@@ -1,0 +1,11 @@
+{
+  "name": "LoRaRadio",
+  "version": "1.0.0",
+  "build": {
+    "includeDir": "include",
+    "srcDir": "src"
+  },
+  "description": "Radio PlatformIO library",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}
