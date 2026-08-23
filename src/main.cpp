@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
+
 #include <Wifi.h>
+#include <Netping.h>
 
 static const uint32_t SERIAL_BAUD = 115200;
 
@@ -43,6 +45,7 @@ static void showMainMenu() {
 
     Serial.println();
     Serial.println("1. Wi-Fi");
+    Serial.println("2. Ping");
     Serial.println("X. Exit");
     Serial.println();
     Serial.print("Select feature: ");
@@ -57,6 +60,8 @@ static void featureMenu() {
 
         if (command == "1") {
             Wifi::feature();
+        } else if (command == "2") {
+            Netping::feature();
         } else if (command.equalsIgnoreCase("X")) {
             Serial.println("Menu idle.");
             return;
@@ -70,13 +75,15 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(1000);
 
+    WiFi.mode(WIFI_STA);
+
     Wifi::begin();
+    Netping::begin();
 
     Serial.println();
     Serial.println("========================================");
     Serial.println("ESP32 NETWORK UTILITY");
     Serial.println("========================================");
-    Serial.println("Persistent configuration loaded.");
 
     if (Wifi::isConfigured()) {
         Serial.println("Saved Wi-Fi configuration detected.");
@@ -84,11 +91,12 @@ void setup() {
     }
 
     Serial.println("Boot complete.");
-
     featureMenu();
 }
 
 void loop() {
     Wifi::service();
+    Netping::service();
+
     delay(100);
 }
