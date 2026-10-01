@@ -99,8 +99,8 @@ static void loadDefaults()
     preambleLength = DEFAULT_PREAMBLE_LENGTH;
     syncWord = DEFAULT_SYNC_WORD;
     crcEnabled = DEFAULT_CRC;
+    nodeName = DEFAULT_NODE_NAME;
 }
-
 static void saveConfiguration()
 {
     preferences.begin("lora", false);
@@ -108,6 +108,7 @@ static void saveConfiguration()
     preferences.putBool("configured", true);
     preferences.putBool("enabled", enabled);
 
+    preferences.putString("node_name", nodeName);
     preferences.putFloat("frequency", frequency);
     preferences.putFloat("bandwidth", bandwidth);
     preferences.putUChar("sf", spreadingFactor);
@@ -135,6 +136,11 @@ static void loadConfiguration()
         enabled = preferences.getBool(
             "enabled",
             true
+        );
+
+        nodeName = preferences.getString(
+            "node_name",
+            DEFAULT_NODE_NAME
         );
 
         frequency = preferences.getFloat(
@@ -357,6 +363,12 @@ static void printConfiguration()
     Serial.println("GENERAL RADIO CONFIGURATION");
     Serial.println("========================================");
 
+
+    Serial.printf(
+        "Node Name / ID   : %s\n",
+        nodeName.c_str()
+    );
+
     Serial.printf(
         "Frequency        : %.3f MHz\n",
         frequency
@@ -399,6 +411,37 @@ static void printConfiguration()
 
     Serial.println();
 }
+
+static void editNodeName()
+{
+    Serial.println();
+    Serial.printf(
+        "Enter Node Name / ID [%s]: ",
+        nodeName.c_str()
+    );
+
+    String input = readInput();
+    input.trim();
+
+    if (input.length() == 0) {
+        Serial.println("Invalid node name.");
+        return;
+    }
+
+    if (input.length() > 31) {
+        Serial.println(
+            "Node name must be 31 characters or less."
+        );
+        return;
+    }
+
+    nodeName = input;
+
+    saveConfiguration();
+
+    Serial.println("Node Name / ID updated.");
+}
+
 
 static void editFrequency()
 {
@@ -620,15 +663,16 @@ static void configureManually()
     while (true) {
         printConfiguration();
 
-        Serial.println("1. Edit Frequency");
-        Serial.println("2. Edit Bandwidth");
-        Serial.println("3. Edit Spreading Factor");
-        Serial.println("4. Edit Coding Rate");
-        Serial.println("5. Edit TX Power");
-        Serial.println("6. Edit Preamble Length");
-        Serial.println("7. Edit Sync Word");
-        Serial.println("8. Edit CRC");
-        Serial.println("9. Use Default Values");
+        Serial.println("1. Edit Node Name / ID");
+        Serial.println("2. Edit Frequency");
+        Serial.println("3. Edit Bandwidth");
+        Serial.println("4. Edit Spreading Factor");
+        Serial.println("5. Edit Coding Rate");
+        Serial.println("6. Edit TX Power");
+        Serial.println("7. Edit Preamble Length");
+        Serial.println("8. Edit Sync Word");
+        Serial.println("9. Edit CRC");
+        Serial.println("10. Use Default Values");
         Serial.println("X. Back");
         Serial.print("Select: ");
 
@@ -637,27 +681,28 @@ static void configureManually()
         command.toUpperCase();
 
         if (command == "1") {
-            editFrequency();
+            editNodeName();
         } else if (command == "2") {
-            editBandwidth();
+            editFrequency();
         } else if (command == "3") {
-            editSpreadingFactor();
+            editBandwidth();
         } else if (command == "4") {
-            editCodingRate();
+            editSpreadingFactor();
         } else if (command == "5") {
-            editTxPower();
+            editCodingRate();
         } else if (command == "6") {
-            editPreambleLength();
+            editTxPower();
         } else if (command == "7") {
-            editSyncWord();
+            editPreambleLength();
         } else if (command == "8") {
-            editCRC();
+            editSyncWord();
         } else if (command == "9") {
+            editCRC();
+        } else if (command == "10") {
             loadDefaults();
 
             saveConfiguration();
 
-            Serial.println();
             Serial.println("Default values restored.");
         } else if (command == "X") {
             return;
