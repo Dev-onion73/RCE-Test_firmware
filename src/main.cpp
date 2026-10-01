@@ -1,28 +1,30 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <nvs_flash.h>
+#include <esp_err.h>
 
 #include <Wifi.h>
 #include <Netping.h>
 #include <NTP.h>
-#include <lora_radio.h>
+#include <Clock.h>
 
-static const uint32_t SERIAL_BAUD = 115200;
+static const uint32_t SERIAL_BAUD=115200;
 
-static String readMainCommand() {
+static String readMainCommand(){
     String input;
 
-    while (true) {
-        while (Serial.available()) {
-            char c = Serial.read();
+    while(true){
+        while(Serial.available()){
+            char c=Serial.read();
 
-            if (c == '\n' || c == '\r') {
-                if (input.length() > 0) {
+            if(c=='\n'||c=='\r'){
+                if(input.length()>0){
                     Serial.println();
                     input.trim();
                     return input;
                 }
-            } else {
-                input += c;
+            }else{
+                input+=c;
                 Serial.print(c);
             }
         }
@@ -31,43 +33,110 @@ static String readMainCommand() {
     }
 }
 
-static void showMainMenu() {
+static void resetAllConfiguration(){
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("SYSTEM CONFIGURATION RESET");
+    Serial.println("========================================");
+    Serial.println();
+    Serial.println("WARNING: This will erase ALL persistent configuration.");
+    Serial.println();
+    Serial.println("The following will be removed:");
+    Serial.println("- Wi-Fi configuration");
+    Serial.println("- NTP configuration");
+    Serial.println("- All other data stored in NVS");
+    Serial.println();
+    Serial.println("This operation cannot be undone.");
+    Serial.println();
+    Serial.println("Type RESET to continue.");
+    Serial.println("X. Cancel");
+    Serial.println();
+    Serial.print("> ");
+
+    String command=readMainCommand();
+    command.trim();
+
+    if(command.equalsIgnoreCase("X")){
+        Serial.println("Configuration reset cancelled.");
+        return;
+    }
+
+    if(command!="RESET"){
+        Serial.println("Reset not confirmed.");
+        return;
+    }
+
+    Serial.println();
+    Serial.println("Erasing NVS...");
+
+    esp_err_t result=nvs_flash_erase();
+
+    if(result!=ESP_OK){
+        Serial.printf(
+            "NVS erase failed: %s\n",
+            esp_err_to_name(result)
+        );
+        Serial.println("Configuration was NOT reset.");
+        return;
+    }
+
+    Serial.println("NVS erased successfully.");
+    Serial.println("All persistent configuration has been removed.");
+    Serial.println("Restarting node...");
+
+    delay(1000);
+    ESP.restart();
+}
+
+static void showMainMenu(){
     Serial.println();
     Serial.println("========================================");
     Serial.println("ESP32 NETWORK UTILITY");
     Serial.println("========================================");
 
-    if (Wifi::isConnected()) {
+    if(Wifi::isConnected()){
         Serial.println("Wi-Fi Status : CONNECTED");
-        Serial.printf("SSID         : %s\n", Wifi::ssid().c_str());
-        Serial.printf("IP           : %s\n", Wifi::ipAddress().c_str());
-    } else {
+        Serial.printf(
+            "SSID         : %s\n",
+            Wifi::ssid().c_str()
+        );
+        Serial.printf(
+            "IP           : %s\n",
+            Wifi::ipAddress().c_str()
+        );
+    }else{
         Serial.println("Wi-Fi Status : NOT CONNECTED");
     }
 
     Serial.println();
 
-    if (NTP::hasValidSystemTime()) {
-        Serial.printf("Time         : %s\n", NTP::currentTime().c_str());
-        Serial.printf("Date         : %s\n", NTP::currentDate().c_str());
+    if(NTP::hasValidSystemTime()){
+        Serial.printf(
+            "Time         : %s\n",
+            NTP::currentTime().c_str()
+        );
+        Serial.printf(
+            "Date         : %s\n",
+            NTP::currentDate().c_str()
+        );
 
-        if (NTP::isSynchronized()) {
+        if(NTP::isSynchronized()){
             Serial.println("NTP Status   : SYNCHRONIZED");
-        } else if (NTP::isConfigured() && NTP::isEnabled()) {
+        }else if(NTP::isConfigured()&&NTP::isEnabled()){
             Serial.println("NTP Status   : ENABLED / NOT SYNCED");
-        } else if (NTP::isConfigured()) {
+        }else if(NTP::isConfigured()){
             Serial.println("NTP Status   : DISABLED");
-        } else {
+        }else{
             Serial.println("NTP Status   : NOT CONFIGURED");
         }
-    } else {
+    }else{
         Serial.println("Time         : NOT SET");
 
-        if (NTP::isConfigured() && NTP::isEnabled()) {
+        if(NTP::isConfigured()&&NTP::isEnabled()){
             Serial.println("NTP Status   : ENABLED / NOT SYNCED");
-        } else if (NTP::isConfigured()) {
+        }else if(NTP::isConfigured()){
             Serial.println("NTP Status   : DISABLED");
-        } else {
+        }else{
             Serial.println("NTP Status   : NOT CONFIGURED");
         }
     }
@@ -76,37 +145,40 @@ static void showMainMenu() {
     Serial.println("1. Wi-Fi");
     Serial.println("2. Ping");
     Serial.println("3. NTP Time");
-    Serial.println("4. LoRa Radio");
+    Serial.println("4. Clock");
+    Serial.println("5. Reset Configuration");
     Serial.println("X. Exit");
     Serial.println();
     Serial.print("Select feature: ");
 }
 
-static void featureMenu() {
-    while (true) {
+static void featureMenu(){
+    while(true){
         showMainMenu();
 
-        String command = readMainCommand();
+        String command=readMainCommand();
         command.trim();
 
-        if (command == "1") {
+        if(command=="1"){
             Wifi::feature();
-        } else if (command == "2") {
+        }else if(command=="2"){
             Netping::feature();
-        } else if (command == "3") {
+        }else if(command=="3"){
             NTP::feature();
-        } else if (command == "4") {
-            LoRaRadio::feature();
-        } else if (command.equalsIgnoreCase("X")) {
+        }else if(command=="4"){
+            Clock::feature();
+        }else if(command=="5"){
+            resetAllConfiguration();
+        }else if(command.equalsIgnoreCase("X")){
             Serial.println("Node entering standby.");
             return;
-        } else {
+        }else{
             Serial.println("Invalid selection.");
         }
     }
 }
 
-void setup() {
+void setup(){
     Serial.begin(SERIAL_BAUD);
     delay(1000);
 
@@ -115,7 +187,7 @@ void setup() {
     Wifi::begin();
     Netping::begin();
     NTP::begin();
-    LoRaRadio::begin();
+    Clock::begin();
 
     Serial.println();
     Serial.println("========================================");
@@ -123,27 +195,33 @@ void setup() {
     Serial.println("========================================");
     Serial.println("Persistent configuration loaded.");
 
-    if (Wifi::isConfigured()) {
+    if(Wifi::isConfigured()){
         Serial.println("Saved Wi-Fi configuration detected.");
         Wifi::connectSaved();
     }
 
-    if (NTP::isConfigured()) {
+    if(NTP::isConfigured()){
         Serial.println("Saved NTP configuration detected.");
 
-        if (NTP::isEnabled()) {
+        if(NTP::isEnabled()){
             Serial.println("NTP is enabled.");
 
-            if (Wifi::isConnected()) {
-                if (NTP::syncNow()) {
-                    Serial.println("Startup NTP synchronization successful.");
-                } else {
-                    Serial.println("Startup NTP synchronization failed.");
+            if(Wifi::isConnected()){
+                if(NTP::syncNow()){
+                    Serial.println(
+                        "Startup NTP synchronization successful."
+                    );
+                }else{
+                    Serial.println(
+                        "Startup NTP synchronization failed."
+                    );
                 }
-            } else {
-                Serial.println("Waiting for Wi-Fi before NTP synchronization.");
+            }else{
+                Serial.println(
+                    "Waiting for Wi-Fi before NTP synchronization."
+                );
             }
-        } else {
+        }else{
             Serial.println("NTP is disabled.");
         }
     }
@@ -152,17 +230,17 @@ void setup() {
     featureMenu();
 }
 
-void loop() {
+void loop(){
     Wifi::service();
     Netping::service();
     NTP::service();
-    LoRaRadio::service();
+    Clock::service();
 
-    if (Serial.available()) {
-        String command = Serial.readStringUntil('\n');
+    if(Serial.available()){
+        String command=Serial.readStringUntil('\n');
         command.trim();
 
-        if (command.equalsIgnoreCase("WAKE")) {
+        if(command.equalsIgnoreCase("WAKE")){
             featureMenu();
         }
     }
