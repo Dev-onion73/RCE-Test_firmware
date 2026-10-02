@@ -2,7 +2,9 @@
 #include <Preferences.h>
 #include <SPI.h>
 #include <RadioLib.h>
+#include <ArduinoJson.h>
 #include <cstdlib>
+#include <ctime>
 
 #include "Radio.h"
 
@@ -27,7 +29,10 @@ static constexpr int8_t DEFAULT_TX_POWER = 14;
 static constexpr uint16_t DEFAULT_PREAMBLE_LENGTH = 8;
 static constexpr uint8_t DEFAULT_SYNC_WORD = 0x12;
 static constexpr bool DEFAULT_CRC = true;
+
 static constexpr const char* DEFAULT_NODE_NAME = "NODE-01";
+
+static constexpr uint32_t BROADCAST_INTERVAL = 5000;
 
 static Preferences preferences;
 
@@ -63,7 +68,16 @@ static int8_t txPower = DEFAULT_TX_POWER;
 static uint16_t preambleLength = DEFAULT_PREAMBLE_LENGTH;
 static uint8_t syncWord = DEFAULT_SYNC_WORD;
 static bool crcEnabled = DEFAULT_CRC;
+
 static String nodeName = DEFAULT_NODE_NAME;
+
+static bool broadcastMode = false;
+static bool receiverMode = false;
+
+static uint32_t broadcastSequence = 0;
+static uint32_t lastBroadcastTime = 0;
+
+static volatile bool packetReceived = false;
 
 static String readInput()
 {
@@ -89,6 +103,11 @@ static String readInput()
     }
 }
 
+static void setPacketReceivedFlag()
+{
+    packetReceived = true;
+}
+
 static void loadDefaults()
 {
     frequency = DEFAULT_FREQUENCY;
@@ -101,6 +120,7 @@ static void loadDefaults()
     crcEnabled = DEFAULT_CRC;
     nodeName = DEFAULT_NODE_NAME;
 }
+
 static void saveConfiguration()
 {
     preferences.begin("lora", false);
@@ -109,6 +129,7 @@ static void saveConfiguration()
     preferences.putBool("enabled", enabled);
 
     preferences.putString("node_name", nodeName);
+
     preferences.putFloat("frequency", frequency);
     preferences.putFloat("bandwidth", bandwidth);
     preferences.putUChar("sf", spreadingFactor);
@@ -282,14 +303,12 @@ static bool initializeRadio()
     ready = false;
     radioError = RADIOLIB_ERR_NONE;
 
+    packetReceived = false;
+
     if (!configured) {
         return false;
     }
 
-    /*
-     * Use exactly the same SPI configuration as the
-     * standalone test program that is known to work.
-     */
     spi.begin(
         RADIO_SCK,
         RADIO_MISO,
@@ -297,19 +316,6 @@ static bool initializeRadio()
         RADIO_NSS
     );
 
-    /*
-     * IMPORTANT:
-     *
-     * Do not use:
-     *
-     *     radio.XTAL = true;
-     *
-     * Do not use the long begin() overload with the
-     * TCXO parameter.
-     *
-     * The known-good standalone test initializes the
-     * SX1262 with the simple begin(frequency) call.
-     */
     radioError = radio.begin(
         frequency
     );
@@ -325,11 +331,6 @@ static bool initializeRadio()
 
     detected = true;
 
-    /*
-     * The module has successfully initialized.
-     *
-     * Now apply the remaining stored configuration.
-     */
     if (!applyRadioConfiguration()) {
         ready = false;
 
@@ -362,7 +363,6 @@ static void printConfiguration()
     Serial.println("========================================");
     Serial.println("GENERAL RADIO CONFIGURATION");
     Serial.println("========================================");
-
 
     Serial.printf(
         "Node Name / ID   : %s\n",
@@ -421,6 +421,7 @@ static void editNodeName()
     );
 
     String input = readInput();
+
     input.trim();
 
     if (input.length() == 0) {
@@ -441,7 +442,6 @@ static void editNodeName()
 
     Serial.println("Node Name / ID updated.");
 }
-
 
 static void editFrequency()
 {
@@ -700,9 +700,9 @@ static void configureManually()
             editCRC();
         } else if (command == "10") {
             loadDefaults();
-
             saveConfiguration();
 
+            Serial.println();
             Serial.println("Default values restored.");
         } else if (command == "X") {
             return;
@@ -801,6 +801,542 @@ static void showStatus()
     Serial.println();
 }
 
+/* =========================================================
+ * TIMESTAMP
+ * ========================================================= */
+
+static String getUTCTimestamp()
+{
+    time_t now = time(nullptr);
+
+    /*
+     * The ESP32 system clock is considered valid only
+     * after NTP synchronization.
+     */
+    if (now < 1000000000) {
+        return "TIME-NOT-SYNCHRONIZED";
+    }
+
+    struct tm timeInfo;
+
+    gmtime_r(
+        &now,
+        &timeInfo
+    );
+
+    char timestamp[32];
+
+    strftime(
+        timestamp,
+        sizeof(timestamp),
+        "%Y-%m-%dT%H:%M:%SZ",
+        &timeInfo
+    );
+
+    return String(timestamp);
+}
+
+/* =========================================================
+ * BROADCAST
+ * ========================================================= */
+
+static String generateRandomPayload()
+{
+    static const char characters[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789";
+
+    const size_t characterCount =
+        sizeof(characters) - 1;
+
+    uint8_t length = random(5, 16);
+
+    String result;
+
+    result.reserve(length);
+
+    for (uint8_t i = 0; i < length; i++) {
+        result += characters[
+            random(characterCount)
+        ];
+    }
+
+    return result;
+}
+
+static String getTransmissionTimestamp()
+{
+    return getUTCTimestamp();
+}
+
+static String createBroadcastPacket()
+{
+    JsonDocument document;
+
+    document["NODE-ID"] =
+        nodeName;
+
+    document["TRANSMISSION-TIMESTAMP"] =
+        getTransmissionTimestamp();
+
+    document["SEQ-NO"] =
+        broadcastSequence;
+
+    document["PAYLOAD"] =
+        generateRandomPayload();
+
+    /*
+     * RSSI and SNR intentionally do not belong
+     * in the transmitted application payload.
+     *
+     * They are measured by the receiver.
+     */
+
+    String packet;
+
+    serializeJson(
+        document,
+        packet
+    );
+
+    return packet;
+}
+
+static bool transmitBroadcast()
+{
+    String packet = createBroadcastPacket();
+
+    radioError = radio.transmit(
+        packet.c_str()
+    );
+
+    if (radioError != RADIOLIB_ERR_NONE) {
+        Serial.println();
+        Serial.println(
+            "Broadcast transmission failed."
+        );
+
+        Serial.printf(
+            "RadioLib Error Code : %d\n",
+            radioError
+        );
+
+        return false;
+    }
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("BROADCAST TRANSMISSION");
+    Serial.println("========================================");
+
+    Serial.printf(
+        "SEQ-NO : %lu\n",
+        static_cast<unsigned long>(
+            broadcastSequence
+        )
+    );
+
+    Serial.printf(
+        "Packet : %s\n",
+        packet.c_str()
+    );
+
+    Serial.println();
+
+    return true;
+}
+
+static void startBroadcastMode()
+{
+    broadcastMode = true;
+    receiverMode = false;
+
+    broadcastSequence = 0;
+
+    lastBroadcastTime =
+        millis() - BROADCAST_INTERVAL;
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("BROADCAST MODE");
+    Serial.println("========================================");
+
+    Serial.printf(
+        "Node ID : %s\n",
+        nodeName.c_str()
+    );
+
+    Serial.println(
+        "Interval: 5 seconds"
+    );
+
+    Serial.println(
+        "Press X then Enter to exit."
+    );
+
+    Serial.println();
+
+    while (broadcastMode) {
+        service();
+
+        if (Serial.available()) {
+            String command =
+                Serial.readStringUntil('\n');
+
+            command.trim();
+            command.toUpperCase();
+
+            if (command == "X") {
+                broadcastMode = false;
+            }
+        }
+
+        delay(10);
+    }
+
+    radio.sleep();
+
+    Serial.println();
+    Serial.println("Broadcast mode stopped.");
+}
+
+static void serviceBroadcast()
+{
+    if (!broadcastMode) {
+        return;
+    }
+
+    uint32_t now = millis();
+
+    if (
+        static_cast<uint32_t>(
+            now - lastBroadcastTime
+        ) >= BROADCAST_INTERVAL
+    ) {
+        lastBroadcastTime = now;
+
+        broadcastSequence++;
+
+        transmitBroadcast();
+    }
+}
+
+/* =========================================================
+ * RECEIVER
+ * ========================================================= */
+
+static void printJsonValue(
+    JsonVariantConst value
+)
+{
+    if (value.is<const char*>()) {
+        Serial.println(
+            value.as<const char*>()
+        );
+        return;
+    }
+
+    serializeJson(
+        value,
+        Serial
+    );
+
+    Serial.println();
+}
+
+static void displayJson(
+    JsonVariantConst value,
+    const String& key
+)
+{
+    if (value.is<JsonObjectConst>()) {
+        JsonObjectConst object =
+            value.as<JsonObjectConst>();
+
+        for (
+            JsonPairConst pair :
+            object
+        ) {
+            Serial.print(
+                pair.key().c_str()
+            );
+
+            Serial.print(" : ");
+
+            if (
+                pair.value().is<JsonObjectConst>() ||
+                pair.value().is<JsonArrayConst>()
+            ) {
+                serializeJson(
+                    pair.value(),
+                    Serial
+                );
+
+                Serial.println();
+            } else {
+                printJsonValue(
+                    pair.value()
+                );
+            }
+        }
+
+        return;
+    }
+
+    if (value.is<JsonArrayConst>()) {
+        serializeJson(
+            value,
+            Serial
+        );
+
+        Serial.println();
+
+        return;
+    }
+
+    Serial.print(key);
+    Serial.print(" : ");
+
+    printJsonValue(value);
+}
+
+static void handleReceivedPacket()
+{
+    packetReceived = false;
+
+    /*
+     * Capture the receiver-side timestamp as soon
+     * as the packet-received event is being handled.
+     */
+    String receptionTimestamp =
+        getUTCTimestamp();
+
+    String receivedPacket;
+
+    radioError = radio.readData(
+        receivedPacket
+    );
+
+    /*
+     * RSSI/SNR belong to the received packet and
+     * therefore must be captured from the receiver.
+     */
+    float receivedRSSI =
+        radio.getRSSI();
+
+    float receivedSNR =
+        radio.getSNR();
+
+    if (
+        radioError != RADIOLIB_ERR_NONE
+    ) {
+        Serial.println();
+        Serial.println(
+            "Failed to read received packet."
+        );
+
+        Serial.printf(
+            "RadioLib Error Code : %d\n",
+            radioError
+        );
+
+        radio.startReceive();
+
+        return;
+    }
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("RECEIVED JSON PACKET");
+    Serial.println("========================================");
+
+    JsonDocument document;
+
+    DeserializationError error =
+        deserializeJson(
+            document,
+            receivedPacket
+        );
+
+    if (error) {
+        Serial.println(
+            "Invalid JSON payload."
+        );
+
+        Serial.printf(
+            "JSON Error : %s\n",
+            error.c_str()
+        );
+
+        Serial.println();
+        Serial.println("Raw Payload:");
+        Serial.println(receivedPacket);
+
+        Serial.println();
+        Serial.printf(
+            "RECEPTION-TIMESTAMP : %s\n",
+            receptionTimestamp.c_str()
+        );
+
+        Serial.printf(
+            "RSSI : %.2f dBm\n",
+            receivedRSSI
+        );
+
+        Serial.printf(
+            "SNR  : %.2f dB\n",
+            receivedSNR
+        );
+
+        Serial.println();
+
+        radio.startReceive();
+
+        return;
+    }
+
+    /*
+     * Display the original JSON exactly as received.
+     */
+    displayJson(
+        document.as<JsonVariantConst>(),
+        ""
+    );
+
+    /*
+     * Receiver-generated metadata.
+     * These values are NOT inserted into the
+     * received JSON document.
+     */
+    Serial.printf(
+        "RECEPTION-TIMESTAMP : %s\n",
+        receptionTimestamp.c_str()
+    );
+
+    Serial.printf(
+        "RSSI : %.2f dBm\n",
+        receivedRSSI
+    );
+
+    Serial.printf(
+        "SNR  : %.2f dB\n",
+        receivedSNR
+    );
+
+    Serial.println();
+
+    radioError =
+        radio.startReceive();
+
+    if (
+        radioError != RADIOLIB_ERR_NONE
+    ) {
+        Serial.println(
+            "Failed to restart receiver."
+        );
+
+        Serial.printf(
+            "RadioLib Error Code : %d\n",
+            radioError
+        );
+    }
+}
+
+static void startReceiverMode()
+{
+    broadcastMode = false;
+    receiverMode = true;
+
+    packetReceived = false;
+
+    /*
+     * Install the receive callback before putting
+     * the radio into receive mode.
+     */
+    radio.setPacketReceivedAction(
+        setPacketReceivedFlag
+    );
+
+    radioError =
+        radio.startReceive();
+
+    if (
+        radioError != RADIOLIB_ERR_NONE
+    ) {
+        Serial.println();
+        Serial.println(
+            "Failed to start receiver."
+        );
+
+        Serial.printf(
+            "RadioLib Error Code : %d\n",
+            radioError
+        );
+
+        radio.clearPacketReceivedAction();
+
+        receiverMode = false;
+
+        return;
+    }
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("RECEIVER MODE");
+    Serial.println("========================================");
+
+    Serial.println(
+        "Listening for JSON packets..."
+    );
+
+    Serial.println(
+        "Press X then Enter to exit."
+    );
+
+    Serial.println();
+
+    while (receiverMode) {
+        service();
+
+        if (Serial.available()) {
+            String command =
+                Serial.readStringUntil('\n');
+
+            command.trim();
+            command.toUpperCase();
+
+            if (command == "X") {
+                receiverMode = false;
+            }
+        }
+
+        delay(10);
+    }
+
+    radio.clearPacketReceivedAction();
+
+    radio.sleep();
+
+    Serial.println();
+    Serial.println("Receiver mode stopped.");
+}
+
+static void serviceReceiver()
+{
+    if (!receiverMode) {
+        return;
+    }
+
+    if (packetReceived) {
+        handleReceivedPacket();
+    }
+}
+
+/* =========================================================
+ * MAIN RADIO MENU
+ * ========================================================= */
+
 static void showRadioMenu()
 {
     Serial.println();
@@ -831,6 +1367,8 @@ static void showRadioMenu()
     Serial.println("2. Disable Radio");
     Serial.println("3. General Radio Configuration");
     Serial.println("4. Radio Status");
+    Serial.println("5. Broadcast");
+    Serial.println("6. Receiver");
     Serial.println("X. Exit");
     Serial.print("Select: ");
 }
@@ -848,6 +1386,8 @@ void begin()
 
 void service()
 {
+    serviceBroadcast();
+    serviceReceiver();
 }
 
 bool isConfigured()
@@ -875,7 +1415,12 @@ void setEnabled(bool value)
     enabled = value;
 
     preferences.begin("lora", false);
-    preferences.putBool("enabled", enabled);
+
+    preferences.putBool(
+        "enabled",
+        enabled
+    );
+
     preferences.end();
 
     if (!configured) {
@@ -938,14 +1483,32 @@ void feature()
         } else if (command == "3") {
             configureManually();
 
-            /*
-             * Reinitialize using the newly saved
-             * configuration.
-             */
             initializeRadio();
 
         } else if (command == "4") {
             showStatus();
+
+        } else if (command == "5") {
+            if (!enabled || !ready) {
+                Serial.println();
+                Serial.println(
+                    "Radio must be enabled and ready."
+                );
+                continue;
+            }
+
+            startBroadcastMode();
+
+        } else if (command == "6") {
+            if (!enabled || !ready) {
+                Serial.println();
+                Serial.println(
+                    "Radio must be enabled and ready."
+                );
+                continue;
+            }
+
+            startReceiverMode();
 
         } else if (command == "X") {
             return;
