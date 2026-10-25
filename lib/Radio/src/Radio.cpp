@@ -7,6 +7,8 @@
 #include <ctime>
 
 #include "Radio.h"
+#include "TestMatrix.h"
+#include "RadioTest.h"
 
 namespace Radio {
 
@@ -805,7 +807,7 @@ static void showStatus()
  * TIMESTAMP
  * ========================================================= */
 
-static String getUTCTimestamp()
+String getUTCTimestamp()
 {
     time_t now = time(nullptr);
 
@@ -870,7 +872,7 @@ static String getTransmissionTimestamp()
     return getUTCTimestamp();
 }
 
-static String createBroadcastPacket()
+String createBroadcastPacket()
 {
     JsonDocument document;
 
@@ -1045,7 +1047,7 @@ static void printJsonValue(
     Serial.println();
 }
 
-static void displayJson(
+void displayJson(
     JsonVariantConst value,
     const String& key
 )
@@ -1362,20 +1364,24 @@ static void showRadioMenu()
         Serial.println("Radio State  : NOT READY");
     }
 
-    Serial.println();
     Serial.println("1. Enable Radio");
     Serial.println("2. Disable Radio");
     Serial.println("3. General Radio Configuration");
-    Serial.println("4. Radio Status");
-    Serial.println("5. Broadcast");
-    Serial.println("6. Receiver");
+    Serial.println("4. Test Matrix Configuration");
+    Serial.println("5. Radio Status");
+    Serial.println("6. Broadcast");
+    Serial.println("7. Receiver");
+    Serial.println("8. Test Matrix");
+    Serial.println("9. Radio Test");
     Serial.println("X. Exit");
-    Serial.print("Select: ");
 }
 
 void begin()
 {
     loadConfiguration();
+
+    TestMatrix::begin();
+    RadioTest::begin();
 
     if (!configured) {
         return;
@@ -1456,67 +1462,132 @@ void feature()
         String command = readInput();
 
         command.toUpperCase();
+if (command == "1") {
+    setEnabled(true);
 
-        if (command == "1") {
-            setEnabled(true);
+    Serial.println();
 
-            Serial.println();
-
-            if (ready) {
-                Serial.println("Radio enabled.");
-            } else if (detected) {
-                Serial.println(
-                    "Radio detected but not ready."
-                );
-            } else {
-                Serial.println(
-                    "Radio could not be initialized."
-                );
-            }
-
-        } else if (command == "2") {
-            setEnabled(false);
-
-            Serial.println();
-            Serial.println("Radio disabled.");
-
-        } else if (command == "3") {
-            configureManually();
-
-            initializeRadio();
-
-        } else if (command == "4") {
-            showStatus();
-
-        } else if (command == "5") {
-            if (!enabled || !ready) {
-                Serial.println();
-                Serial.println(
-                    "Radio must be enabled and ready."
-                );
-                continue;
-            }
-
-            startBroadcastMode();
-
-        } else if (command == "6") {
-            if (!enabled || !ready) {
-                Serial.println();
-                Serial.println(
-                    "Radio must be enabled and ready."
-                );
-                continue;
-            }
-
-            startReceiverMode();
-
-        } else if (command == "X") {
-            return;
-
-        } else {
-            Serial.println("Invalid selection.");
-        }
+    if (ready) {
+        Serial.println("Radio enabled.");
+    } else if (detected) {
+        Serial.println(
+            "Radio detected but not ready."
+        );
+    } else {
+        Serial.println(
+            "Radio could not be initialized."
+        );
     }
+
+} else if (command == "2") {
+    setEnabled(false);
+
+    Serial.println();
+    Serial.println("Radio disabled.");
+
+} else if (command == "3") {
+    configureManually();
+
+    initializeRadio();
+
+} else if (command == "4") {
+    TestMatrix::feature();
+
+} else if (command == "8") {
+    TestMatrix::feature();
+
+} else if (command == "9") {
+    RadioTest::feature();
+
+} else if (command == "5") {
+    showStatus();
+
+} else if (command == "6") {
+    if (!enabled || !ready) {
+        Serial.println();
+        Serial.println(
+            "Radio must be enabled and ready."
+        );
+        continue;
+    }
+
+    startBroadcastMode();
+
+} else if (command == "7") {
+    if (!enabled || !ready) {
+        Serial.println();
+        Serial.println(
+            "Radio must be enabled and ready."
+        );
+        continue;
+    }
+
+    startReceiverMode();
+
+} else if (command == "X") {
+    return;
+
+} else {
+    Serial.println("Invalid selection.");
+}
+    }
+}
+
+// ============================================================
+// EXPOSED FOR RADIO TEST MODULE
+// ============================================================
+
+float getFrequency() { return frequency; }
+float getBandwidth() { return bandwidth; }
+uint8_t getSpreadingFactor() { return spreadingFactor; }
+uint8_t getCodingRate() { return codingRate; }
+int8_t getTxPower() { return txPower; }
+uint16_t getPreambleLength() { return preambleLength; }
+uint8_t getSyncWord() { return syncWord; }
+bool getCrcEnabled() { return crcEnabled; }
+String getNodeName() { return nodeName; }
+
+void setFrequency(float f) { frequency = f; }
+void setBandwidth(float bw) { bandwidth = bw; }
+void setSpreadingFactor(uint8_t sf) { spreadingFactor = sf; }
+void setCodingRate(uint8_t cr) { codingRate = cr; }
+void setTxPower(int8_t power) { txPower = power; }
+
+uint32_t getBroadcastSequence() { return broadcastSequence; }
+void incrementBroadcastSequence() { broadcastSequence++; }
+
+// Transmit a packet
+bool transmitPacket(const String& packet) {
+    radioError = radio.transmit(packet.c_str());
+    return radioError == RADIOLIB_ERR_NONE;
+}
+
+// Start receive mode
+bool startReceiveMode() {
+    radioError = radio.startReceive();
+    return radioError == RADIOLIB_ERR_NONE;
+}
+
+// Read received packet
+bool readReceivedPacket(String& packet, float& rssi, float& snr) {
+    radioError = radio.readData(packet);
+    if (radioError != RADIOLIB_ERR_NONE) {
+        return false;
+    }
+    rssi = radio.getRSSI();
+    snr = radio.getSNR();
+    return true;
+}
+
+// Stop receive mode
+void stopReceiveMode() {
+    radio.clearPacketReceivedAction();
+    radio.sleep();
+}
+
+// Set packet received callback
+void setPacketReceivedCallback(void (*callback)()) {
+    radio.setPacketReceivedAction(callback);
 }
 
 }
