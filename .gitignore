@@ -5,3 +5,4 @@
 .venv
 
 compile_commands.json
+platformio.ini
