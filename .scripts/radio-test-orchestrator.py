@@ -23,7 +23,7 @@ import shutil
 from datetime import datetime
 from itertools import product
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
 
@@ -41,14 +41,25 @@ BROADCAST_INTERVAL = 5.0  # seconds between broadcasts (not used in single-shot 
 RECEIVE_WINDOW = 3.0      # seconds to wait for reception after broadcast
 CONFIG_APPLY_DELAY = 1.0  # seconds to wait after sending config
 
+# Resolve the project root from the current working directory when launched
+# from the repository, otherwise from the script location.
+_CWD = Path.cwd().resolve()
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if (_CWD / "data").is_dir():
+    PROJECT_ROOT = _CWD
+elif (_SCRIPT_DIR.parent / "data").is_dir():
+    PROJECT_ROOT = _SCRIPT_DIR.parent
+else:
+    PROJECT_ROOT = _SCRIPT_DIR
+
 # Output files
-OUTPUT_DIR = Path(__file__).parent.parent / "test_results"
-BROADCAST_CSV = OUTPUT_DIR / "broadcast_log.csv"
-RECEIVE_CSV = OUTPUT_DIR / "receive_log.csv"
-SUMMARY_CSV = OUTPUT_DIR / "test_summary.csv"
+OUTPUT_DIR = PROJECT_ROOT / "test_results"
+BROADCAST_JSON = OUTPUT_DIR / "broadcast_log.json"
+RECEIVE_JSON = OUTPUT_DIR / "receive_log.json"
+SUMMARY_JSON = OUTPUT_DIR / "test_summary.json"
 
 # Test matrix file
-TEST_MATRIX_FILE = Path(__file__).parent.parent / "data" / "rce_test_matrix.json"
+TEST_MATRIX_FILE = PROJECT_ROOT / "data" / "rce_test_matrix.json"
 
 
 # ============================================================
@@ -209,8 +220,8 @@ class SerialReader:
                     while '\n' in self.buffer:
                         line, self.buffer = self.buffer.split('\n', 1)
                         line = line.strip('\r')
-                        if line:
-                            self.line_queue.put((time.time(), line))
+                        # Keep empty lines too; they may delimit packet output.
+                        self.line_queue.put((time.time(), line))
                 else:
                     time.sleep(0.01)
             except Exception as e:
@@ -271,152 +282,181 @@ class SerialReader:
 # ============================================================
 
 class BroadcastParser:
-    """Stateful parser for broadcast output."""
-    
-    def __init__(self, config: TestConfig):
+    """Parse broadcaster output without depending on exact spacing/punctuation."""
+
+    def __init__(self, config: TestConfig, logger: Optional[Callable[[str], None]] = None):
         self.config = config
+        self.logger = logger or (lambda msg: None)
         self.current_seq = None
-        self.current_packet = None
+        self.json_buffer = ""
         self.waiting_for_packet = False
-    
+
     def feed(self, line: str) -> Optional[BroadcastRecord]:
-        """Feed a line, return record if complete."""
-        # Look for SEQ-NO
-        if "SEQ-NO" in line and ":" in line:
-            try:
-                self.current_seq = int(line.split(":")[1].strip())
-                self.waiting_for_packet = True
-            except:
-                pass
+        import re
+        self.logger(f"[BroadcastParser] Processing: {line[:160]}")
+
+        match = re.search(r"^\s*SEQ-NO\s*[:=]\s*(\d+)\s*$", line, re.IGNORECASE)
+        if match:
+            self.current_seq = int(match.group(1))
+            self.waiting_for_packet = True
+            self.json_buffer = ""
+            self.logger(f"[BroadcastParser] Found SEQ-NO: {self.current_seq}")
             return None
-        
-        # Look for Packet
-        if self.waiting_for_packet and "Packet" in line and ":" in line:
-            try:
-                # Extract JSON after "Packet : "
-                json_start = line.index("Packet") + len("Packet :")
-                self.current_packet = line[json_start:].strip()
-                self.waiting_for_packet = False
-                
-                # Create record
-                record = BroadcastRecord(
-                    timestamp=datetime.utcnow().isoformat() + "Z",
-                    config_id=self.config.config_id(),
-                    sequence=self.current_seq,
-                    frequency_mhz=self.config.frequency_mhz,
-                    spreading_factor=self.config.spreading_factor,
-                    bandwidth_khz=self.config.bandwidth_khz,
-                    coding_rate=self.config.coding_rate,
-                    tx_power_dbm=self.config.tx_power_dbm,
-                    packet_json=self.current_packet,
-                    raw_line=line
-                )
-                self.current_seq = None
-                self.current_packet = None
-                return record
-            except:
-                self.waiting_for_packet = False
-                return None
-        
+
+        if self.waiting_for_packet:
+            if "packet" in line.lower() and ":" in line:
+                line = line.split(":", 1)[1].strip()
+            if "{" in line or self.json_buffer:
+                self.json_buffer += ("\n" if self.json_buffer else "") + line.strip()
+                try:
+                    start = self.json_buffer.index("{")
+                    end = self.json_buffer.rindex("}") + 1
+                    parsed = json.loads(self.json_buffer[start:end])
+                    packet_json = json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
+                    seq = self.current_seq if self.current_seq is not None else parsed.get("SEQ-NO", 0)
+                    record = BroadcastRecord(
+                        timestamp=datetime.utcnow().isoformat() + "Z",
+                        config_id=self.config.config_id(),
+                        sequence=seq,
+                        frequency_mhz=self.config.frequency_mhz,
+                        spreading_factor=self.config.spreading_factor,
+                        bandwidth_khz=self.config.bandwidth_khz,
+                        coding_rate=self.config.coding_rate,
+                        tx_power_dbm=self.config.tx_power_dbm,
+                        packet_json=packet_json,
+                        raw_line=line,
+                    )
+                    self.current_seq = None
+                    self.json_buffer = ""
+                    self.waiting_for_packet = False
+                    self.logger(f"[BroadcastParser] Created record for seq {record.sequence}")
+                    return record
+                except (ValueError, json.JSONDecodeError):
+                    self.logger("[BroadcastParser] Waiting for remaining JSON lines")
         return None
 
 
 class ReceiveParser:
-    """Stateful parser for receive output."""
-    
-    def __init__(self, config: TestConfig):
+    """Parse receiver output whether it prints raw JSON or decoded KEY : VALUE lines."""
+
+    def __init__(self, config: TestConfig, logger: Optional[Callable[[str], None]] = None):
         self.config = config
+        self.logger = logger or (lambda msg: None)
         self.in_packet = False
         self.packet_lines = []
+        self.packet_fields = {}
         self.rssi = None
         self.snr = None
         self.reception_ts = None
         self.packet_json = None
-    
-    def feed(self, line: str) -> Optional[ReceiveRecord]:
-        """Feed a line, return record if complete."""
-        # Detect start of received packet
-        if "RECEIVED JSON PACKET" in line or "TEST RECEIVED PACKET" in line:
-            self.in_packet = True
-            self.packet_lines = []
-            self.rssi = None
-            self.snr = None
-            self.reception_ts = None
-            self.packet_json = None
+
+    def _reset(self):
+        self.in_packet = False
+        self.packet_lines = []
+        self.packet_fields = {}
+        self.rssi = None
+        self.snr = None
+        self.reception_ts = None
+        self.packet_json = None
+
+    def _make_record(self) -> Optional[ReceiveRecord]:
+        if not self.in_packet or self.rssi is None or self.snr is None:
             return None
-        
+
+        payload = self.packet_fields.copy()
+        seq = payload.get("SEQ-NO", 0)
+        try:
+            seq = int(seq)
+        except (TypeError, ValueError):
+            seq = 0
+
+        packet_json = self.packet_json
+        if not packet_json and payload:
+            packet_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        if not packet_json:
+            self.logger("[ReceiveParser] Not writing record: no packet fields/JSON captured")
+            return None
+
+        record = ReceiveRecord(
+            timestamp=datetime.utcnow().isoformat() + "Z",
+            config_id=self.config.config_id(),
+            sequence=seq,
+            frequency_mhz=self.config.frequency_mhz,
+            spreading_factor=self.config.spreading_factor,
+            bandwidth_khz=self.config.bandwidth_khz,
+            coding_rate=self.config.coding_rate,
+            rssi_dbm=self.rssi,
+            snr_db=self.snr,
+            reception_timestamp=self.reception_ts or "",
+            packet_json=packet_json,
+            raw_line="\n".join(self.packet_lines),
+        )
+        self.logger(f"[ReceiveParser] Created record for seq {seq}, RSSI={self.rssi}, SNR={self.snr}")
+        self._reset()
+        return record
+
+    def feed(self, line: str) -> Optional[ReceiveRecord]:
+        import re
+        self.logger(f"[ReceiveParser] Processing: {line[:160]}")
+        upper_line = line.upper()
+        is_header = "RECEIVED JSON PACKET" in upper_line or "TEST RECEIVED PACKET" in upper_line
+
+        if is_header:
+            previous = self._make_record()
+            self._reset()
+            self.in_packet = True
+            self.packet_lines = [line]
+            self.logger("[ReceiveParser] Started new packet capture")
+            return previous
+
         if not self.in_packet:
             return None
-        
+
         self.packet_lines.append(line)
-        
-        # Extract RSSI
-        if "RSSI" in line and ":" in line and "dBm" in line:
-            try:
-                self.rssi = float(line.split(":")[1].split("dBm")[0].strip())
-            except:
-                pass
-        
-        # Extract SNR
-        if "SNR" in line and ":" in line and "dB" in line:
-            try:
-                self.snr = float(line.split(":")[1].split("dB")[0].strip())
-            except:
-                pass
-        
-        # Extract reception timestamp
-        if "RECEPTION-TIMESTAMP" in line and ":" in line:
-            try:
-                self.reception_ts = line.split(":", 1)[1].strip()
-            except:
-                pass
-        
-        # Try to parse JSON from accumulated lines
+
         if "{" in line or "}" in line:
-            full_text = "\n".join(self.packet_lines)
+            full_text = "\\n".join(self.packet_lines)
             try:
-                # Find JSON object
                 start = full_text.index("{")
                 end = full_text.rindex("}") + 1
-                json_str = full_text[start:end]
-                parsed = json.loads(json_str)
-                self.packet_json = json.dumps(parsed, separators=(',', ':'))
-            except:
+                parsed = json.loads(full_text[start:end])
+                self.packet_json = json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
+                if isinstance(parsed, dict):
+                    self.packet_fields.update(parsed)
+                self.logger(f"[ReceiveParser] Parsed JSON, length: {len(self.packet_json)}")
+            except (ValueError, json.JSONDecodeError):
                 pass
-        
-        # Check for end of packet display (empty line or next packet)
-        if line.strip() == "" and self.packet_json is not None:
-            # End of this packet
-            if self.rssi is not None and self.snr is not None:
-                # Extract sequence from packet JSON
-                seq = 0
-                try:
-                    pkt = json.loads(self.packet_json)
-                    seq = pkt.get("SEQ-NO", 0)
-                except:
-                    pass
-                
-                record = ReceiveRecord(
-                    timestamp=datetime.utcnow().isoformat() + "Z",
-                    config_id=self.config.config_id(),
-                    sequence=seq,
-                    frequency_mhz=self.config.frequency_mhz,
-                    spreading_factor=self.config.spreading_factor,
-                    bandwidth_khz=self.config.bandwidth_khz,
-                    coding_rate=self.config.coding_rate,
-                    rssi_dbm=self.rssi,
-                    snr_db=self.snr,
-                    reception_timestamp=self.reception_ts or "",
-                    packet_json=self.packet_json,
-                    raw_line="\n".join(self.packet_lines)
-                )
-                self.in_packet = False
-                return record
-        
+
+        if ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip().strip("[]")
+            value = value.strip()
+            upper_key = key.upper()
+
+            if upper_key == "RSSI":
+                match = re.search(r"[-+]?\d+(?:\.\d+)?", value)
+                if match:
+                    self.rssi = float(match.group(0))
+                    self.logger(f"[ReceiveParser] Found RSSI: {self.rssi}")
+            elif upper_key == "SNR":
+                match = re.search(r"[-+]?\d+(?:\.\d+)?", value)
+                if match:
+                    self.snr = float(match.group(0))
+                    self.logger(f"[ReceiveParser] Found SNR: {self.snr}")
+            elif upper_key == "RECEPTION-TIMESTAMP":
+                self.reception_ts = value
+                self.logger(f"[ReceiveParser] Found RECEPTION-TIMESTAMP: {self.reception_ts}")
+            elif key and upper_key not in ("RECEPTION-TIMESTAMP",):
+                # Keep decoded payload fields printed by the firmware.
+                if upper_key not in ("RSSI", "SNR"):
+                    self.packet_fields[key] = value
+
+        # Finalize at SNR; no blank separator is required.
+        if self.rssi is not None and self.snr is not None:
+            return self._make_record()
         return None
 
 
-# ============================================================
 # MAIN ORCHESTRATOR
 # ============================================================
 
@@ -437,11 +477,13 @@ class RadioTestOrchestrator:
         self.start_time: Optional[float] = None
         self.config_times: List[float] = []  # Time taken for each config
         
-        # CSV file handles for active writing
-        self._broadcast_csv_file = None
-        self._broadcast_csv_writer = None
-        self._receive_csv_file = None
-        self._receive_csv_writer = None
+        # JSON file handles for active writing
+        self._broadcast_json_file = None
+        self._receive_json_file = None
+        
+        # Debug log file handles for live debugging
+        self._broadcast_debug_file = None
+        self._receive_debug_file = None
         
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -662,71 +704,168 @@ class RadioTestOrchestrator:
         self.broadcaster.clear_queue()
         self.receiver.clear_queue()
         
-        # Initialize CSV files for active writing
-        self._init_csv_files()
+        # Initialize JSON files for active writing
+        self._init_json_files()
+        
+        # Initialize debug log files for live debugging
+        self._init_debug_logs()
         
         return True
     
-    def _init_csv_files(self):
-        """Initialize CSV files for active writing."""
+    def _init_json_files(self):
+        """Initialize JSON files for active writing."""
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         
-        # Broadcast CSV
-        self._broadcast_csv_file = open(BROADCAST_CSV, 'w', newline='')
-        self._broadcast_csv_writer = csv.writer(self._broadcast_csv_file)
-        self._broadcast_csv_writer.writerow([
-            "timestamp", "config_id", "sequence", "frequency_mhz",
-            "spreading_factor", "bandwidth_khz", "coding_rate", "tx_power_dbm",
-            "packet_json", "raw_line"
-        ])
-        self._broadcast_csv_file.flush()
+        # Broadcast JSON - start with empty array
+        self._broadcast_json_file = open(BROADCAST_JSON, 'w+', encoding='utf-8')
+        self._broadcast_json_file.write('[]')
+        self._broadcast_json_file.flush()
+        self._write_debug_log("PARSER", f"[JSON_INIT] Broadcast JSON initialized")
         
-        # Receive CSV
-        self._receive_csv_file = open(RECEIVE_CSV, 'w', newline='')
-        self._receive_csv_writer = csv.writer(self._receive_csv_file)
-        self._receive_csv_writer.writerow([
-            "timestamp", "config_id", "sequence", "frequency_mhz",
-            "spreading_factor", "bandwidth_khz", "coding_rate",
-            "rssi_dbm", "snr_db", "reception_timestamp", "packet_json", "raw_line"
-        ])
-        self._receive_csv_file.flush()
+        # Receive JSON - start with empty array
+        self._receive_json_file = open(RECEIVE_JSON, 'w+', encoding='utf-8')
+        self._receive_json_file.write('[]')
+        self._receive_json_file.flush()
+        self._write_debug_log("PARSER", f"[JSON_INIT] Receive JSON initialized")
         
-        self._log("CSV files initialized for active writing")
+        self._log("JSON files initialized for active writing")
+    
+    def _init_debug_logs(self):
+        """Initialize debug log files for live debugging."""
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # Broadcast debug log
+        broadcast_debug_path = OUTPUT_DIR / "broadcast_debug.log"
+        self._broadcast_debug_file = open(broadcast_debug_path, 'w')
+        self._broadcast_debug_file.write(f"=== Broadcast Debug Log Started at {datetime.now().isoformat()} ===\n")
+        self._broadcast_debug_file.flush()
+        
+        # Receive debug log
+        receive_debug_path = OUTPUT_DIR / "receive_debug.log"
+        self._receive_debug_file = open(receive_debug_path, 'w')
+        self._receive_debug_file.write(f"=== Receive Debug Log Started at {datetime.now().isoformat()} ===\n")
+        self._receive_debug_file.flush()
+        
+        self._log(f"Debug logs initialized: {broadcast_debug_path}, {receive_debug_path}")
+    
+    def _write_debug_log(self, node_name: str, line: str):
+        """Write a line to the appropriate debug log file."""
+        timestamp = datetime.now().isoformat()
+        formatted = f"[{timestamp}] {line}\n"
+        
+        if node_name == "BROADCASTER" and self._broadcast_debug_file:
+            self._broadcast_debug_file.write(formatted)
+            self._broadcast_debug_file.flush()
+        elif node_name == "RECEIVER" and self._receive_debug_file:
+            self._receive_debug_file.write(formatted)
+            self._receive_debug_file.flush()
+        elif node_name == "PARSER":
+            # Write parser logs to both debug files for correlation
+            if self._broadcast_debug_file:
+                self._broadcast_debug_file.write(formatted)
+                self._broadcast_debug_file.flush()
+            if self._receive_debug_file:
+                self._receive_debug_file.write(formatted)
+                self._receive_debug_file.flush()
     
     def _write_broadcast_record(self, record: BroadcastRecord):
-        """Write a broadcast record to CSV immediately."""
-        if self._broadcast_csv_writer:
-            self._broadcast_csv_writer.writerow([
-                record.timestamp, record.config_id, record.sequence, record.frequency_mhz,
-                record.spreading_factor, record.bandwidth_khz, record.coding_rate, record.tx_power_dbm,
-                record.packet_json, record.raw_line
-            ])
-            self._broadcast_csv_file.flush()
+        """Write a broadcast record to JSON immediately."""
+        self._write_debug_log("PARSER", f"[JSON_WRITE] Writing broadcast record seq={record.sequence}")
+        if self._broadcast_json_file:
+            try:
+                # Read existing data
+                self._broadcast_json_file.seek(0)
+                data = json.load(self._broadcast_json_file)
+                
+                # Append new record
+                record_dict = {
+                    "timestamp": record.timestamp,
+                    "config_id": record.config_id,
+                    "sequence": record.sequence,
+                    "frequency_mhz": record.frequency_mhz,
+                    "spreading_factor": record.spreading_factor,
+                    "bandwidth_khz": record.bandwidth_khz,
+                    "coding_rate": record.coding_rate,
+                    "tx_power_dbm": record.tx_power_dbm,
+                    "packet_json": record.packet_json,
+                    "raw_line": record.raw_line
+                }
+                data.append(record_dict)
+                
+                # Write back
+                self._broadcast_json_file.seek(0)
+                self._broadcast_json_file.truncate()
+                json.dump(data, self._broadcast_json_file, indent=2, ensure_ascii=False)
+                self._broadcast_json_file.write('\n')
+                self._broadcast_json_file.flush()
+                self._write_debug_log("PARSER", f"[JSON_WRITE] Broadcast record written successfully")
+            except Exception as e:
+                self._write_debug_log("PARSER", f"[JSON_WRITE] ERROR writing broadcast: {e}")
+        else:
+            self._write_debug_log("PARSER", f"[JSON_WRITE] ERROR: broadcast_json_file is None!")
     
     def _write_receive_record(self, record: ReceiveRecord):
-        """Write a receive record to CSV immediately."""
-        if self._receive_csv_writer:
-            self._receive_csv_writer.writerow([
-                record.timestamp, record.config_id, record.sequence, record.frequency_mhz,
-                record.spreading_factor, record.bandwidth_khz, record.coding_rate,
-                record.rssi_dbm, record.snr_db, record.reception_timestamp, record.packet_json, record.raw_line
-            ])
-            self._receive_csv_file.flush()
+        """Write a receive record to JSON immediately."""
+        self._write_debug_log("PARSER", f"[JSON_WRITE] Writing receive record seq={record.sequence}")
+        if self._receive_json_file:
+            try:
+                # Read existing data
+                self._receive_json_file.seek(0)
+                data = json.load(self._receive_json_file)
+                
+                # Append new record
+                record_dict = {
+                    "timestamp": record.timestamp,
+                    "config_id": record.config_id,
+                    "sequence": record.sequence,
+                    "frequency_mhz": record.frequency_mhz,
+                    "spreading_factor": record.spreading_factor,
+                    "bandwidth_khz": record.bandwidth_khz,
+                    "coding_rate": record.coding_rate,
+                    "rssi_dbm": record.rssi_dbm,
+                    "snr_db": record.snr_db,
+                    "reception_timestamp": record.reception_timestamp,
+                    "packet_json": record.packet_json,
+                    "raw_line": record.raw_line
+                }
+                data.append(record_dict)
+                
+                # Write back
+                self._receive_json_file.seek(0)
+                self._receive_json_file.truncate()
+                json.dump(data, self._receive_json_file, indent=2, ensure_ascii=False)
+                self._receive_json_file.write('\n')
+                self._receive_json_file.flush()
+                self._write_debug_log("PARSER", f"[JSON_WRITE] Receive record written successfully")
+            except Exception as e:
+                self._write_debug_log("PARSER", f"[JSON_WRITE] ERROR writing receive: {e}")
+        else:
+            self._write_debug_log("PARSER", f"[JSON_WRITE] ERROR: receive_json_file is None!")
     
     def disconnect_nodes(self):
-        """Disconnect from both serial ports and close CSV files."""
+        """Disconnect from both serial ports and close JSON files."""
         self.broadcaster.stop()
         self.receiver.stop()
         
-        # Close CSV files
-        if self._broadcast_csv_file:
-            self._broadcast_csv_file.close()
-            self._broadcast_csv_file = None
-            self._broadcast_csv_writer = None
-        if self._receive_csv_file:
-            self._receive_csv_file.close()
-            self._receive_csv_file = None
-            self._receive_csv_writer = None
+        # Close JSON files
+        if self._broadcast_json_file:
+            self._write_debug_log("PARSER", "[JSON_CLOSE] Closing broadcast JSON")
+            self._broadcast_json_file.close()
+            self._broadcast_json_file = None
+        if self._receive_json_file:
+            self._write_debug_log("PARSER", "[JSON_CLOSE] Closing receive JSON")
+            self._receive_json_file.close()
+            self._receive_json_file = None
+        
+        # Close debug log files
+        if self._broadcast_debug_file:
+            self._broadcast_debug_file.write(f"=== Broadcast Debug Log Ended at {datetime.now().isoformat()} ===\n")
+            self._broadcast_debug_file.close()
+            self._broadcast_debug_file = None
+        if self._receive_debug_file:
+            self._receive_debug_file.write(f"=== Receive Debug Log Ended at {datetime.now().isoformat()} ===\n")
+            self._receive_debug_file.close()
+            self._receive_debug_file = None
     
     def enter_test_mode(self, reader: SerialReader, name: str) -> bool:
         """Navigate to Radio Test mode (option 9) on a node."""
@@ -741,6 +880,7 @@ class RadioTestOrchestrator:
         lines = reader.get_lines(2.0)
         for _, line in lines:
             self._log(f"[{name}] {line}")
+            self._write_debug_log(name, line)
             if "Enter JSON" in line or "RADIO TEST" in line:
                 return True
         
@@ -793,9 +933,12 @@ class RadioTestOrchestrator:
         self.broadcaster.clear_queue()
         self.receiver.clear_queue()
         
-        # Parsers
-        bcast_parser = BroadcastParser(config)
-        recv_parser = ReceiveParser(config)
+        # Parsers with debug logging
+        def parser_logger(msg: str):
+            self._write_debug_log("PARSER", msg)
+        
+        bcast_parser = BroadcastParser(config, logger=parser_logger)
+        recv_parser = ReceiveParser(config, logger=parser_logger)
         
         # Test loop - send one broadcast per config
         NUM_BROADCASTS_PER_CONFIG = 1
@@ -823,6 +966,7 @@ class RadioTestOrchestrator:
                 # Read broadcaster lines
                 for _, line in self.broadcaster.get_lines(0.1):
                     self._log(f"[BROADCASTER] {line}")
+                    self._write_debug_log("BROADCASTER", line)
                     record = bcast_parser.feed(line)
                     if record:
                         self.broadcast_records.append(record)
@@ -833,6 +977,7 @@ class RadioTestOrchestrator:
                 # Read receiver lines
                 for _, line in self.receiver.get_lines(0.1):
                     self._log(f"[RECEIVER] {line}")
+                    self._write_debug_log("RECEIVER", line)
                     record = recv_parser.feed(line)
                     if record:
                         self.receive_records.append(record)
@@ -896,31 +1041,38 @@ class RadioTestOrchestrator:
         return summary
     
     def save_results(self):
-        """Save summary results to CSV file (broadcast and receive CSVs are written actively)."""
+        """Save summary results to JSON file (broadcast and receive JSONs are written actively)."""
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         
-        # Summary CSV only - broadcast and receive CSVs are written actively during experiment
-        with open(SUMMARY_CSV, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "config_id", "frequency_mhz", "spreading_factor", "bandwidth_khz",
-                "coding_rate", "tx_power_dbm", "broadcasts_sent", "packets_received",
-                "packet_loss_percent", "avg_rssi_dbm", "avg_snr_db",
-                "min_rssi_dbm", "max_rssi_dbm", "min_snr_db", "max_snr_db",
-                "test_duration_sec", "status"
-            ])
-            for s in self.summaries:
-                writer.writerow([
-                    s.config_id, s.frequency_mhz, s.spreading_factor, s.bandwidth_khz,
-                    s.coding_rate, s.tx_power_dbm, s.broadcasts_sent, s.packets_received,
-                    s.packet_loss_percent, s.avg_rssi_dbm, s.avg_snr_db,
-                    s.min_rssi_dbm, s.max_rssi_dbm, s.min_snr_db, s.max_snr_db,
-                    s.test_duration_sec, s.status
-                ])
+        # Summary JSON only - broadcast and receive JSONs are written actively during experiment
+        summary_data = []
+        for s in self.summaries:
+            summary_data.append({
+                "config_id": s.config_id,
+                "frequency_mhz": s.frequency_mhz,
+                "spreading_factor": s.spreading_factor,
+                "bandwidth_khz": s.bandwidth_khz,
+                "coding_rate": s.coding_rate,
+                "tx_power_dbm": s.tx_power_dbm,
+                "broadcasts_sent": s.broadcasts_sent,
+                "packets_received": s.packets_received,
+                "packet_loss_percent": s.packet_loss_percent,
+                "avg_rssi_dbm": s.avg_rssi_dbm,
+                "avg_snr_db": s.avg_snr_db,
+                "min_rssi_dbm": s.min_rssi_dbm,
+                "max_rssi_dbm": s.max_rssi_dbm,
+                "min_snr_db": s.min_snr_db,
+                "max_snr_db": s.max_snr_db,
+                "test_duration_sec": s.test_duration_sec,
+                "status": s.status
+            })
         
-        self._log(f"Summary saved to {SUMMARY_CSV}")
-        self._log(f"Broadcast log: {BROADCAST_CSV} (written actively)")
-        self._log(f"Receive log: {RECEIVE_CSV} (written actively)")
+        with open(SUMMARY_JSON, 'w') as f:
+            json.dump(summary_data, f, indent=2)
+        
+        self._log(f"Summary saved to {SUMMARY_JSON}")
+        self._log(f"Broadcast log: {BROADCAST_JSON} (written actively)")
+        self._log(f"Receive log: {RECEIVE_JSON} (written actively)")
     
     def run(self):
         """Run the complete test matrix."""
